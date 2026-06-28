@@ -22,6 +22,9 @@ use crate::reentrancy_guard::GuardError as ReentrancyError;
 /// Platform fee percentage (2% = 200 basis points)
 pub const PLATFORM_FEE_PERCENTAGE: i128 = crate::config::DEFAULT_PLATFORM_FEE_PERCENTAGE;
 
+/// Creator fee percentage (default 0%)
+pub const CREATOR_FEE_PERCENTAGE: i128 = 0;
+
 /// Market creation fee (1 XLM = 10,000,000 stroops)
 pub const MARKET_CREATION_FEE: i128 = crate::config::DEFAULT_MARKET_CREATION_FEE;
 
@@ -37,10 +40,10 @@ pub const FEE_COLLECTION_THRESHOLD: i128 = crate::config::FEE_COLLECTION_THRESHO
 // ===== DYNAMIC FEE CONSTANTS =====
 
 /// Maximum fee percentage (5%)
-pub const MAX_FEE_PERCENTAGE: i128 = 500; // 5.00% in basis points
+pub const MAX_FEE_PERCENTAGE: i128 = crate::config::MAX_PLATFORM_FEE_PERCENTAGE;
 
-/// Minimum fee percentage (0.1%)
-pub const MIN_FEE_PERCENTAGE: i128 = 10; // 0.10% in basis points
+/// Minimum fee percentage (0%)
+pub const MIN_FEE_PERCENTAGE: i128 = crate::config::MIN_PLATFORM_FEE_PERCENTAGE;
 
 /// Minimum delay in ledgers before a committed fee config can be revealed
 pub const MIN_DELAY_LEDGERS: u32 = 120; // 10 minutes at ~5s/ledger
@@ -120,6 +123,8 @@ pub const MARKET_SIZE_LARGE: i128 = 10_000_000_000; // 1000 XLM
 pub struct FeeConfig {
     /// Platform fee percentage
     pub platform_fee_percentage: i128,
+    /// Creator fee percentage
+    pub creator_fee_percentage: i128,
     /// Market creation fee
     pub creation_fee: i128,
     /// Minimum fee amount
@@ -568,12 +573,33 @@ pub struct FeeValidationResult {
 /// from the total staked amount, showing each component of the fee calculation
 /// and the final amounts. Essential for transparency and user understanding.
 ///
+/// # Conservation Invariant (CRITICAL)
+///
+/// **platform_share + creator_share + winner_share == total_staked**
+///
+/// This invariant is enforced by all calculation functions and tested extensively
+/// with proptest to ensure no rounding or calculation errors ever break this
+/// critical property.
+///
+/// # Rounding Strategy
+///
+/// All fee calculations use **floor rounding** (via `checked_bps_floor`) for both
+/// platform and creator shares. The winner share is then calculated as:
+///
+/// `winner_share = total_staked - (platform_share + creator_share)`
+///
+/// This guarantees that:
+/// 1. Rounding errors are borne entirely by the winner share (not the fees)
+/// 2. The conservation invariant always holds exactly
+/// 3. No overflow or underflow can occur (via checked arithmetic)
+///
 /// # Breakdown Components
 ///
 /// Fee breakdown includes:
-/// - Original stake amounts and fee percentages
-/// - Calculated fee amounts and platform fees
-/// - Final user payout amounts after fee deduction
+/// - Original stake amount
+/// - Fee percentages (platform and creator, in basis points)
+/// - Calculated share amounts (platform, creator, winner)
+/// - Total fee amount
 /// - Complete calculation transparency
 ///
 /// # Example Usage
@@ -581,14 +607,19 @@ pub struct FeeValidationResult {
 /// ```rust
 /// # use predictify_hybrid::fees::FeeBreakdown;
 ///
-/// // Fee breakdown for 100 XLM stake at 2% fee
+/// // Fee breakdown for 100 XLM stake at 3% platform, 2% creator fees
 /// let breakdown = FeeBreakdown {
 ///     total_staked: 1_000_000_000, // 100 XLM total stake
-///     fee_percentage: 200, // 2.00% fee rate
-///     fee_amount: 20_000_000, // 2 XLM fee
-///     platform_fee: 20_000_000, // 2 XLM platform fee
-///     user_payout_amount: 980_000_000, // 98 XLM after fees
+///     platform_fee_percentage: 300, // 3.00% platform fee
+///     creator_fee_percentage: 200,  // 2.00% creator fee
+///     fee_amount: 50_000_000, // 5 XLM total fee
+///     platform_share: 30_000_000, // 3 XLM platform share
+///     creator_share: 20_000_000,  // 2 XLM creator share
+///     winner_share: 950_000_000,  // 95 XLM winner share
 /// };
+///
+/// // Verify conservation (should always be true)
+/// assert_eq!(breakdown.platform_share + breakdown.creator_share + breakdown.winner_share, breakdown.total_staked);
 ///
 /// // Display breakdown to user
 /// println!("Fee Calculation Breakdown");
@@ -627,14 +658,18 @@ pub struct FeeValidationResult {
 pub struct FeeBreakdown {
     /// Total staked amount
     pub total_staked: i128,
-    /// Fee percentage
-    pub fee_percentage: i128,
-    /// Calculated fee amount
+    /// Platform fee percentage
+    pub platform_fee_percentage: i128,
+    /// Creator fee percentage
+    pub creator_fee_percentage: i128,
+    /// Calculated total fee amount
     pub fee_amount: i128,
-    /// Platform fee
-    pub platform_fee: i128,
-    /// User payout amount (after fees)
-    pub user_payout_amount: i128,
+    /// Platform fee share
+    pub platform_share: i128,
+    /// Creator fee share
+    pub creator_share: i128,
+    /// Winner (user) payout amount (after fees)
+    pub winner_share: i128,
 }
 
 // ===== FEE MANAGER =====
@@ -932,6 +967,7 @@ impl FeeManager {
         // Fallback to current config
         FeeConfigManager::get_fee_config(env).unwrap_or(FeeConfig {
             platform_fee_percentage: PLATFORM_FEE_PERCENTAGE,
+            creator_fee_percentage: CREATOR_FEE_PERCENTAGE,
             creation_fee: MARKET_CREATION_FEE,
             min_fee_amount: MIN_FEE_AMOUNT,
             max_fee_amount: MAX_FEE_AMOUNT,
@@ -1114,9 +1150,6 @@ impl FeeCalculator {
         market: &Market,
     ) -> Result<FeeBreakdown, Error> {
         let total_staked = market.total_staked;
-        let fee_amount = Self::calculate_platform_fee_with_env(env, market_id, market)?;
-        let platform_fee = fee_amount;
-        let user_payout_amount = Self::checked_fee_sub(total_staked, fee_amount)?;
 
         // Find the earliest bet timestamp for the market
         let users = crate::bets::BetStorage::get_all_bets_for_market(env, market_id);
@@ -1128,14 +1161,32 @@ impl FeeCalculator {
                 }
             }
         }
-        let fee_percentage = FeeManager::get_fee_percentage_for_timestamp(env, earliest_timestamp);
+        let fee_config = FeeManager::get_fee_config_for_timestamp(env, earliest_timestamp);
+        
+        let platform_fee_percentage = if fee_config.fees_enabled { fee_config.platform_fee_percentage } else { 0 };
+        let creator_fee_percentage = if fee_config.fees_enabled { fee_config.creator_fee_percentage } else { 0 };
+        
+        let platform_share = Self::checked_bps_floor(total_staked, platform_fee_percentage)?;
+        let creator_share = Self::checked_bps_floor(total_staked, creator_fee_percentage)?;
+        let fee_amount = Self::checked_fee_add(platform_share, creator_share)?;
+        let winner_share = Self::checked_fee_sub(total_staked, fee_amount)?;
+
+        if fee_amount < MIN_FEE_AMOUNT && (platform_fee_percentage > 0 || creator_fee_percentage > 0) {
+            return Err(Error::InsufficientStake);
+        }
+
+        if fee_amount > total_staked {
+            return Err(Error::InvalidFeeConfig);
+        }
 
         Ok(FeeBreakdown {
             total_staked,
-            fee_percentage,
+            platform_fee_percentage,
+            creator_fee_percentage,
             fee_amount,
-            platform_fee,
-            user_payout_amount,
+            platform_share,
+            creator_share,
+            winner_share,
         })
     }
 
@@ -1152,9 +1203,9 @@ impl FeeCalculator {
             return Err(Error::InvalidFeeConfig);
         }
 
-        let fee_percentage = PLATFORM_FEE_PERCENTAGE;
+        let total_fee_bps = PLATFORM_FEE_PERCENTAGE + CREATOR_FEE_PERCENTAGE;
         let user_share =
-            Self::checked_bps_floor(user_stake, crate::PERCENTAGE_DENOMINATOR - fee_percentage)?;
+            Self::checked_bps_floor(user_stake, crate::PERCENTAGE_DENOMINATOR - total_fee_bps)?;
         let payout = Self::checked_mul_div_floor(user_share, total_pool, winning_total)?;
 
         Ok(payout)
@@ -1162,21 +1213,34 @@ impl FeeCalculator {
 
     /// Calculate fee breakdown for a market
     ///
-    /// The platform fee is rounded down (floor), and the user payout is computed as the exact
-    /// checked remainder so the two amounts always reconcile to `total_staked`.
+    /// The platform and creator fees are rounded down (floor), and the winner payout is computed as the exact
+    /// checked remainder so the three amounts always reconcile to `total_staked`.
     pub fn calculate_fee_breakdown(market: &Market) -> Result<FeeBreakdown, Error> {
         let total_staked = market.total_staked;
-        let fee_percentage = PLATFORM_FEE_PERCENTAGE;
-        let fee_amount = Self::calculate_platform_fee(market)?;
-        let platform_fee = fee_amount;
-        let user_payout_amount = Self::checked_fee_sub(total_staked, fee_amount)?;
+        let platform_fee_percentage = PLATFORM_FEE_PERCENTAGE;
+        let creator_fee_percentage = CREATOR_FEE_PERCENTAGE;
+        
+        let platform_share = Self::checked_bps_floor(total_staked, platform_fee_percentage)?;
+        let creator_share = Self::checked_bps_floor(total_staked, creator_fee_percentage)?;
+        let fee_amount = Self::checked_fee_add(platform_share, creator_share)?;
+        let winner_share = Self::checked_fee_sub(total_staked, fee_amount)?;
+
+        if fee_amount < MIN_FEE_AMOUNT && (platform_fee_percentage > 0 || creator_fee_percentage > 0) {
+            return Err(Error::InsufficientStake);
+        }
+
+        if fee_amount > total_staked {
+            return Err(Error::InvalidFeeConfig);
+        }
 
         Ok(FeeBreakdown {
             total_staked,
-            fee_percentage,
+            platform_fee_percentage,
+            creator_fee_percentage,
             fee_amount,
-            platform_fee,
-            user_payout_amount,
+            platform_share,
+            creator_share,
+            winner_share,
         })
     }
 
@@ -1983,6 +2047,7 @@ impl FeeConfigManager {
             .get(&config_key)
             .unwrap_or(FeeConfig {
                 platform_fee_percentage: PLATFORM_FEE_PERCENTAGE,
+                creator_fee_percentage: CREATOR_FEE_PERCENTAGE,
                 creation_fee: MARKET_CREATION_FEE,
                 min_fee_amount: MIN_FEE_AMOUNT,
                 max_fee_amount: MAX_FEE_AMOUNT,
@@ -1995,6 +2060,7 @@ impl FeeConfigManager {
     pub fn reset_to_defaults(env: &Env) -> Result<FeeConfig, Error> {
         let default_config = FeeConfig {
             platform_fee_percentage: PLATFORM_FEE_PERCENTAGE,
+            creator_fee_percentage: CREATOR_FEE_PERCENTAGE,
             creation_fee: MARKET_CREATION_FEE,
             min_fee_amount: MIN_FEE_AMOUNT,
             max_fee_amount: MAX_FEE_AMOUNT,
@@ -2173,6 +2239,7 @@ pub mod testing {
     pub fn create_test_fee_config() -> FeeConfig {
         FeeConfig {
             platform_fee_percentage: PLATFORM_FEE_PERCENTAGE,
+            creator_fee_percentage: CREATOR_FEE_PERCENTAGE,
             creation_fee: MARKET_CREATION_FEE,
             min_fee_amount: MIN_FEE_AMOUNT,
             max_fee_amount: MAX_FEE_AMOUNT,
@@ -2201,16 +2268,21 @@ pub mod testing {
     pub fn create_test_fee_breakdown() -> FeeBreakdown {
         FeeBreakdown {
             total_staked: 1_000_000_000, // 100 XLM
-            fee_percentage: PLATFORM_FEE_PERCENTAGE,
+            platform_fee_percentage: PLATFORM_FEE_PERCENTAGE,
+            creator_fee_percentage: CREATOR_FEE_PERCENTAGE,
             fee_amount: 20_000_000, // 2 XLM
-            platform_fee: 20_000_000,
-            user_payout_amount: 980_000_000, // 98 XLM
+            platform_share: 20_000_000,
+            creator_share: 0,
+            winner_share: 980_000_000, // 98 XLM
         }
     }
 
     /// Validate fee configuration
     pub fn validate_fee_config_structure(config: &FeeConfig) -> Result<(), Error> {
         if config.platform_fee_percentage < 0 {
+            return Err(Error::InvalidInput);
+        }
+        if config.creator_fee_percentage < 0 {
             return Err(Error::InvalidInput);
         }
 
@@ -2353,10 +2425,11 @@ mod checked_arithmetic_tests {
         let breakdown = FeeCalculator::calculate_fee_breakdown(&market).unwrap();
 
         assert_eq!(breakdown.fee_amount, 1_000_000);
-        assert_eq!(
-            breakdown.platform_fee + breakdown.user_payout_amount,
-            breakdown.total_staked
-        );
+        let total = FeeCalculator::checked_fee_add(
+            FeeCalculator::checked_fee_add(breakdown.platform_share, breakdown.creator_share).unwrap(),
+            breakdown.winner_share
+        ).unwrap();
+        assert_eq!(total, breakdown.total_staked);
     }
 
     #[test]

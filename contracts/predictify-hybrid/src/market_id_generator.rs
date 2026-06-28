@@ -120,7 +120,7 @@ pub struct MarketIdGenerator;
         /// #[cfg(test)]
         /// fn test_seed_sealing() {
         ///     let env = Env::default();
-        ///     let contract_id = env.register(crate::PredictifyHybrid, ()));
+        ///     let contract_id = env.register(crate::PredictifyHybrid, ());
         ///     
         ///     // Seed must be unsealed initially
         ///     assert!(!MarketIdGenerator::is_seed_sealed(&env));
@@ -347,45 +347,7 @@ pub struct MarketIdGenerator;
         result
     }
 
-    // ── Seed sealing methods ───────────────────────────────────────────────────
 
-    /// Mark the seed as sealed, preventing future regeneration.
-    ///
-    /// This is a one-time operation typically called during contract initialization
-    /// to ensure deterministic ID generation throughout the contract's lifecycle.
-    ///
-    /// # Requirements
-    ///
-    /// This function must be called exactly once before any calls to `generate_market_id`
-    /// to maintain the security guarantees of the Market ID system.
-    ///
-    /// # Panics
-    ///
-    /// - [`Error::InvalidState`] if attempting to seal an already sealed seed
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// #[cfg(test)]
-    /// fn test_seed_sealing() {
-    ///     let env = Env::default();
-    ///     let contract_id = env.register(crate::PredictifyHybrid, ()));
-    ///     
-    ///     // Seed must be unsealed initially
-    ///     assert!(!MarketIdGenerator::is_seed_sealed(&env));
-    ///     
-    ///     // Seal the seed (one-time operation)
-    ///     MarketIdGenerator::seal_seed(&env);
-    ///     
-    ///     // After sealing, regeneration is prohibited
-    ///     assert!(MarketIdGenerator::is_seed_sealed(&env));
-    ///     
-    ///     // Any attempt to generate IDs will fail
-    ///     // (this would be tested with a failing test case)
-    /// }
-    /// ```
-            .extend_ttl(&key, env.storage().max_ttl(), env.storage().max_ttl());
-    }
 
     // ── Registry write-or-fail methods ────────────────────────────────────────
 

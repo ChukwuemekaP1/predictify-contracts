@@ -619,6 +619,16 @@ pub struct FeeConfig {
     /// Range: 0-1000 (0% to 10%)
     pub platform_fee_percentage: i128,
 
+    /// Creator fee percentage in basis points (1/100th of a percent).
+    ///
+    /// This fee is taken from winning payouts and goes to the market creator.
+    /// Examples:
+    /// - 100 = 1.0% fee
+    /// - 250 = 2.5% fee
+    ///
+    /// Range: 0-1000 (0% to 10%)
+    pub creator_fee_percentage: i128,
+
     /// Fixed fee required to create a new prediction market (in stroops).
     ///
     /// This fee prevents spam market creation and covers:
@@ -1661,6 +1671,7 @@ impl ConfigManager {
     pub fn get_default_fee_config() -> FeeConfig {
         FeeConfig {
             platform_fee_percentage: DEFAULT_PLATFORM_FEE_PERCENTAGE,
+            creator_fee_percentage: 0,          // 0% for default
             creation_fee: DEFAULT_MARKET_CREATION_FEE,
             min_fee_amount: MIN_FEE_AMOUNT,
             max_fee_amount: MAX_FEE_AMOUNT,
@@ -1679,6 +1690,7 @@ impl ConfigManager {
     ///
     /// The mainnet configuration includes:
     /// - **Platform Fee**: 3% of winning payouts (vs 2% default)
+    /// - **Creator Fee**: 0% of winning payouts (default)
     /// - **Creation Fee**: 1.5 XLM to create markets (vs 1 XLM default)
     /// - **Minimum Fee**: 0.2 XLM floor (vs 0.1 XLM default)
     /// - **Maximum Fee**: 200 XLM ceiling (vs 100 XLM default)
@@ -1723,7 +1735,8 @@ impl ConfigManager {
     /// - Transparent and predictable
     pub fn get_mainnet_fee_config() -> FeeConfig {
         FeeConfig {
-            platform_fee_percentage: 3,        // 3% for mainnet
+            platform_fee_percentage: 300,        // 3% for mainnet (basis points)
+            creator_fee_percentage: 0,           // 0% for mainnet (basis points)
             creation_fee: 15_000_000,          // 1.5 XLM for mainnet
             min_fee_amount: 2_000_000,         // 0.2 XLM for mainnet
             max_fee_amount: 2_000_000_000,     // 200 XLM for mainnet

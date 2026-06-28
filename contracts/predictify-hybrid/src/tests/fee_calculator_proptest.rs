@@ -70,6 +70,7 @@ pub mod proptest {
         use proptest::prelude::*;
 
         let platform_fee_percentage = 0..10_000i128; // 0-100% in basis points
+        let creator_fee_percentage = 0..10_000i128; // 0-100% in basis points
         let creation_fee = 0..100_000_000i128; // 0-1.0 XLM
         let min_fee_amount = 1_000_000i128..=100_000_000i128; // 0.01-10 XLM
         let max_fee_amount = prop::range(1_000_000i128..=1_000_000_000i128)
@@ -77,10 +78,11 @@ pub mod proptest {
         let collection_threshold = 10_000_000i128..=100_000_000i128; // 1-10 XLM
         let fees_enabled = prop::bool::NO_SIDE_EFFECTS;
 
-        (platform_fee_percentage, creation_fee, min_fee_amount, max_fee_amount, collection_threshold, fees_enabled)
+        (platform_fee_percentage, creator_fee_percentage, creation_fee, min_fee_amount, max_fee_amount, collection_threshold, fees_enabled)
             .prop_map(
                 |(
                     platform_fee_percentage,
+                    creator_fee_percentage,
                     creation_fee,
                     min_fee_amount,
                     (max_fee_amount, _),
@@ -88,6 +90,7 @@ pub mod proptest {
                     fees_enabled,
                 )| crate::types::FeeConfig {
                     platform_fee_percentage,
+                    creator_fee_percentage,
                     creation_fee,
                     min_fee_amount,
                     max_fee_amount: max_fee_amount.max(min_fee_amount),
@@ -215,11 +218,11 @@ pub mod proptest {
                     // Fee must be non-negative
                     assert!(fee >= 0, "Fee is negative: {}", fee);
 
-                    // If fee is calculated, platform_fee in breakdown should match
+                    // If fee is calculated, platform_share in breakdown should match
                     let breakdown = FeeCalculator::calculate_fee_breakdown(&market).unwrap();
-                    assert_eq!(breakdown.platform_fee, fee,
-                        "Platform fee mismatch in breakdown: {} vs {}",
-                        breakdown.platform_fee, fee);
+                    assert_eq!(breakdown.platform_share, fee,
+                        "Platform share mismatch in breakdown: {} vs {}",
+                        breakdown.platform_share, fee);
                 }
             });
         });
@@ -314,12 +317,16 @@ pub mod proptest {
                                 payout, user_stake);
 
                             let breakdown = FeeCalculator::calculate_fee_breakdown(&market).unwrap();
-                            let total = breakdown.platform_fee + breakdown.user_payout_amount;
+                            let total = FeeCalculator::checked_fee_add(
+                                FeeCalculator::checked_fee_add(breakdown.platform_share, breakdown.creator_share).unwrap(),
+                                breakdown.winner_share
+                            ).unwrap();
 
-                            // Platform fee + user payout must not exceed total staked
-                            assert!(total <= total_pool,
-                                "Platform fee + payout {} exceeds total_pool {} ({} + {}) for {} total",
-                                total, total_pool, breakdown.platform_fee, breakdown.user_payout_amount, total_pool);
+                            // Platform fee + creator fee + winner payout must equal total staked
+                            assert_eq!(total, total_pool,
+                                "Conservation invariant: {} + {} + {} = {} != total_pool {}",
+                                breakdown.platform_share, breakdown.creator_share, breakdown.winner_share,
+                                total, total_pool);
                         },
                         Err(_) => {
                             // Some combinations are invalid (e.g., zero winning_total)
@@ -376,9 +383,9 @@ pub mod proptest {
         });
     }
 
-    /// Property test 6: Fee fee calculator arithmetic consistency
+    /// Property test 6: Fee calculator arithmetic consistency
     /// The fee calculator's internal arithmetic operations must be consistent
-    /// For example: platform_fee + user_payout_amount should equal total_staked
+    /// For example: platform_share + creator_share + winner_share should equal total_staked
     #[test]
     fn fee_calculator_arithmetic_consistency_property() {
         test(|| {
@@ -405,23 +412,24 @@ pub mod proptest {
                     let breakdown = FeeCalculator::calculate_fee_breakdown(&market).unwrap();
 
                     // Verify the arithmetic invariant:
-                    // platform_fee + user_payout_amount == total_staked
+                    // platform_share + creator_share + winner_share == total_staked
                     let total = FeeCalculator::checked_fee_add(
-                        breakdown.platform_fee,
-                        breakdown.user_payout_amount
+                        FeeCalculator::checked_fee_add(breakdown.platform_share, breakdown.creator_share).unwrap(),
+                        breakdown.winner_share
                     ).unwrap();
 
                     assert_eq!(total, market.total_staked,
-                        "Arithmetic invariant violated: fee + payout ({}) != total_staked ({}) for {} total",
+                        "Arithmetic invariant violated: {} + {} + {} = {} != total_staked ({}) for {} total",
+                        breakdown.platform_share, breakdown.creator_share, breakdown.winner_share,
                         total, market.total_staked, market.total_staked);
 
                     // Verify individual components
-                    assert!(breakdown.platform_fee >= 0,
-                        "Platform fee negative: {}", breakdown.platform_fee);
-
-                    assert!(breakdown.user_payout_amount >= 0,
-                        "User payout negative: {}", breakdown.user_payout_amount);
-
+                    assert!(breakdown.platform_share >= 0,
+                        "Platform share negative: {}", breakdown.platform_share);
+                    assert!(breakdown.creator_share >= 0,
+                        "Creator share negative: {}", breakdown.creator_share);
+                    assert!(breakdown.winner_share >= 0,
+                        "Winner share negative: {}", breakdown.winner_share);
                     assert!(breakdown.fee_amount >= 0,
                         "Fee amount negative: {}", breakdown.fee_amount);
                 }
@@ -458,8 +466,8 @@ pub mod proptest {
                         assert!(fee >= 0, "Fee negative for stake {}: {}", stake, fee);
 
                         let breakdown = FeeCalculator::calculate_fee_breakdown(&market).unwrap();
-                        assert_eq!(breakdown.platform_fee, fee,
-                            "Platform fee mismatch in edge case");
+                        assert_eq!(breakdown.platform_share, fee,
+                            "Platform share mismatch in edge case");
                     },
                     Err(_) => {
                         // Error is acceptable for edge cases
@@ -496,6 +504,83 @@ pub mod proptest {
                     }
                 }
             }
+        });
+    }
+
+    /// Property test 8: Fee breakdown conservation invariant
+    /// For all valid inputs, platform_share + creator_share + winner_share must equal total_staked
+    #[test]
+    fn fee_breakdown_conservation_property() {
+        test(|| {
+            use proptest::prelude::*;
+
+            let env = Env::default();
+            let admin = Address::generate(&env);
+
+            // Generate valid stake amounts
+            let stakes = generate_stake_amounts()
+                .prop_filter(|&x| x > 0)
+                .prop_shuffle()
+                .prop_take(50);
+
+            // Test edge cases explicitly
+            let edge_stakes = vec![
+                1i128,                  // Minimum possible stake
+                10_000_000i128,         // Exactly 1 XLM
+                100_000_000i128,        // 10 XLM
+                1_000_000_000i128,      // 100 XLM
+            ];
+
+            // Test edge cases first
+            for stake in edge_stakes {
+                let market_id = create_test_market(&env, admin.clone(), stake);
+                let market = MarketStateManager::get_market(&env, &market_id).unwrap();
+                
+                if let Ok(breakdown) = FeeCalculator::calculate_fee_breakdown(&market) {
+                    // Verify conservation invariant
+                    let total = FeeCalculator::checked_fee_add(
+                        FeeCalculator::checked_fee_add(breakdown.platform_share, breakdown.creator_share).unwrap(),
+                        breakdown.winner_share
+                    ).unwrap();
+                    
+                    assert_eq!(total, market.total_staked,
+                        "Conservation invariant violated: {} + {} + {} = {} != stake {}",
+                        breakdown.platform_share, breakdown.creator_share, breakdown.winner_share,
+                        total, market.total_staked);
+
+                    // Verify individual components are non-negative
+                    assert!(breakdown.platform_share >= 0, "Platform share negative: {}", breakdown.platform_share);
+                    assert!(breakdown.creator_share >= 0, "Creator share negative: {}", breakdown.creator_share);
+                    assert!(breakdown.winner_share >= 0, "Winner share negative: {}", breakdown.winner_share);
+                }
+            }
+
+            // Test randomly generated stakes
+            stakes.proptest_individuals(|stake_iter| {
+                for item in stake_iter {
+                    let stake = item.unwrap().0;
+                    let market_id = create_test_market(&env, admin.clone(), stake);
+                    let market = MarketStateManager::get_market(&env, &market_id).unwrap();
+                    
+                    if let Ok(breakdown) = FeeCalculator::calculate_fee_breakdown(&market) {
+                        // Verify conservation invariant
+                        let total = FeeCalculator::checked_fee_add(
+                            FeeCalculator::checked_fee_add(breakdown.platform_share, breakdown.creator_share).unwrap(),
+                            breakdown.winner_share
+                        ).unwrap();
+                        
+                        assert_eq!(total, market.total_staked,
+                            "Conservation invariant violated: {} + {} + {} = {} != stake {}",
+                            breakdown.platform_share, breakdown.creator_share, breakdown.winner_share,
+                            total, market.total_staked);
+
+                        // Verify individual components are non-negative
+                        assert!(breakdown.platform_share >= 0, "Platform share negative: {}", breakdown.platform_share);
+                        assert!(breakdown.creator_share >= 0, "Creator share negative: {}", breakdown.creator_share);
+                        assert!(breakdown.winner_share >= 0, "Winner share negative: {}", breakdown.winner_share);
+                    }
+                }
+            });
         });
     }
 }
